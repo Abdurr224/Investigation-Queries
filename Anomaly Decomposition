@@ -1,0 +1,58 @@
+let inc = SecurityIncident
+| where Title contains "compromise"
+//| where IncidentNumber == " " //insert incident number
+| mv-expand AlertIds
+| extend id = tostring(AlertIds)
+| distinct id, Title;
+let alert = 
+SecurityAlert
+| join inc on $left. SystemAlertId==$right. id
+| where SystemAlertId in (inc)
+| extend Entities = parse_json(Entities)
+| mv-expand Entities
+| project prince = tostring(Entities.AadUserId), AlertName, Title, TimeGenerated
+| summarize make_set(AlertName) by prince, Title, TimeGenerated
+| top 1 by TimeGenerated
+| where isnotempty(prince)
+| project prince;
+let identity = materialize (IdentityInfo    
+| where AccountObjectId in~ (alert) 
+| where TimeGenerated >= ago(14d)
+| distinct
+  UPN = tolower(AccountUPN),
+  JobTitle,
+  Department,
+  Country,
+  Privs = tostring(AssignedRoles));
+  //break for UPN search
+let starttime = 30d;
+let endtime = -1d;
+let timeframe = 1d;
+let lookback = 2d;
+let baseData = union withsource=log SigninLogs, AADNonInteractiveUserSignInLogs
+| where UserPrincipalName in ( identity) //UPN search
+| extend UserPrincipalName
+| where TimeGenerated between (startofday(ago(starttime))..startofday(ago(endtime)));
+let UserSeries = baseData
+| make-series Users = dcount(UserPrincipalName) default = 0 on TimeGenerated from startofday(ago(starttime)) to startofday(ago(endtime)) step timeframe
+| extend (flag, score, baseline) = series_decompose_anomalies(Users, 1.5, -1, 'avg', 1)
+| mv-expand TimeGenerated to typeof(datetime), score to typeof(double)
+| project TimeGenerated, UserScore = abs(score);
+let ASNSeries = baseData
+| make-series ASNs = dcount(AutonomousSystemNumber) default = 0 on TimeGenerated from startofday(ago(starttime)) to startofday(ago(endtime)) step timeframe
+| extend (flag, score, baseline) = series_decompose_anomalies(ASNs, 1.5, -1, 'avg', 1)
+| mv-expand TimeGenerated to typeof(datetime), score to typeof(double)
+| project TimeGenerated, ASNScore = abs(score);
+let LocationSeries = baseData
+| make-series Locs = dcount(Location) default = 0 on TimeGenerated from startofday(ago(starttime)) to startofday(ago(endtime)) step timeframe
+| extend (flag, score, baseline) = series_decompose_anomalies(Locs, 1.5, -1, 'avg', 1)
+| mv-expand TimeGenerated to typeof(datetime), score to typeof(double)
+| project TimeGenerated, LocationScore = abs(score);
+let upn = toscalar(identity | project UPN | take 1);
+UserSeries
+| join kind=inner ASNSeries on TimeGenerated
+| join kind=inner LocationSeries on TimeGenerated
+| extend WeightedScore = (UserScore * 0.1) + (ASNScore * 0.5) + (LocationScore * 0.4) //weighting
+| project TimeGenerated, UserScore, ASNScore, LocationScore, WeightedScore
+| order by WeightedScore desc
+| render areachart  with (title=upn)
