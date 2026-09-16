@@ -7,7 +7,7 @@ Currently set to look for "Potential Compromise" alerts from latest
 - 3 infrastructure dataset fallbacks for isp/proxy/infra domain
 - Option to change to individual incident number if this not the latest alert
 - Bruteforce analysis from 30d with soft verdict
-- Login variation based on location, asn, country and application
+- Login history based on location, asn, country and application
 - Most popular result code in 30d
 - Open leak credential alert checks
 
