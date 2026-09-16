@@ -1,0 +1,78 @@
+let inc = SecurityIncident
+| where IncidentNumber == " " //incident number
+| mv-expand AlertIds
+| extend id = tostring(AlertIds)
+| distinct id;
+let alert = SecurityAlert
+| where SystemAlertId in (inc)
+| extend Entities = parse_json(Entities)
+| mv-expand Entities
+| project prince = tostring(Entities.AadUserId)
+| where isnotempty(prince);
+//use bellow if its a non incident and separate everything above this
+//
+let lookback = 1d;
+let identity = materialize (IdentityInfo
+//| where AccountUPN contains ""    
+| where AccountObjectId  in~ (alert)
+| where TimeGenerated >= ago(14d)
+| distinct UPN = tolower(AccountUPN), JobTitle, Department,Country, Privs = tostring(AssignedRoles));
+let leak = SecurityAlert
+| where TimeGenerated >= ago(14d)
+| where AlertName contains "Leaked"
+| extend parse_json(tostring(Entities))
+| extend leaked = iff(Status != "Resolved","True","")
+| where isnotempty(leaked)
+| project user = Entities[0].UserPrincipalName, TimeGenerated, leaked
+| distinct  leaked_user = tostring(user);
+let ASNcount = SigninLogs
+| where UserPrincipalName in (identity)
+| where TimeGenerated >= ago(60d)
+| where ResultType == "0"
+| summarize num = count() by (AutonomousSystemNumber);
+//
+union SigninLogs,AADNonInteractiveUserSignInLogs
+| where TimeGenerated >= ago(lookback)
+| where UserPrincipalName in (identity)
+| extend leaked = UserPrincipalName in (leak)
+| extend size = substring(UserAgent,0,11)
+| extend AuthenticationDetails = parse_json(AuthenticationDetails)| mv-expand AuthenticationDetails
+| extend DeviceDetail = iff(isempty(DeviceDetail_dynamic) == true, parse_json(DeviceDetail_string), DeviceDetail_dynamic)
+| extend Location = iff(isempty(LocationDetails_dynamic) == true, parse_json(LocationDetails_string), LocationDetails_dynamic)
+| extend auth = tostring(AuthenticationDetails.authenticationStepResultDetail)
+| extend TrustDev = iff(tostring(DeviceDetail.trustType) !="" , "Managed","Unmanaged")
+| extend TrustNet =iff(NetworkLocationDetails != "[]","trusted","")
+| extend AuthReq = iif(AuthenticationRequirement contains "singleFactorAuthentication", 
+AuthenticationRequirement = "SFA", "MFA")
+| extend ResultSignature = iff(ResultType contains "50140","SUCCESS*",ResultSignature)
+| extend Description = iif(ResultSignature == "FAILURE", ResultDescription, "")
+| extend ResultDescription = iff(ResultType contains "70043", ResultDescription = "refresh token has expired or is invalid due to sign-in frequency checks*",ResultSignature)
+| extend Result = iif(ResultSignature == "FAILURE", strcat("FAILURE | ",tostring(ResultType)," | ", tostring(Description)), "SUCCESS") 
+| extend ASN_IP = strcat("AS", tostring(AutonomousSystemNumber), " | ", IPAddress)
+| extend Device = strcat(tostring(DeviceDetail.browser)," - ", tostring(DeviceDetail.operatingSystem)," - ",size," - ",tostring(DeviceDetail.displayName))
+| join kind=inner (
+    identity
+) on $left.UserPrincipalName == $right.UPN
+//| extend Country
+| join kind=leftouter (
+    _GetWatchlist('Alpha2')
+    | project Land = ["Land"], Alpha2 = ["Alpha2"]
+) on $left.Country == $right.Land
+|extend loc = iff(Country == Land, Alpha2,"")
+| join kind=leftouter ASNcount on AutonomousSystemNumber
+| project
+    //TimeGenerated,
+    UserPrincipalName,
+    AppDisplayName,
+    UserLoc_IPLoc = strcat(iff(isempty(loc), "N/A", loc)," -> ",Location.countryOrRegion),
+    ASN_IP,
+    ASNFreq = num, // frequency of failed sign ins from ASN
+    // TrustNet, // If IP is part of a trusted network group
+    Result,
+    Device,
+    TrustDev,
+    SessionId,
+    Auth_CAP = strcat(tostring(AuthReq)," - ", tostring(ConditionalAccessStatus)),
+    Department_Role = strcat(tostring(JobTitle)," - ", tostring(Department))
+    CredsLeaked = leaked,  //Check if this user is included in an active Leaked Credentials alert
+    Privs
