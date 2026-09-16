@@ -1,0 +1,324 @@
+let IP2ProxyLite = externaldata
+    (Network: string, ProxyType: string, CountryCode: string, CountryName: string,
+    Region: string, City: string, ISP: string, Domain: string, UsageType: string,
+    ASN: string, ASName: string, LastSeen: string, Threat: string, Provider: string)
+    [h'https://raw.githubusercontent.com/ip2location/sample-databases/main/IP2Proxy/PX11/ip2proxy-px11-sample.ipv4.cidr.csv']
+    with (format = 'csv', ignoreFirstRecord = false)
+    | extend LastSeenNum = tolong(LastSeen)
+    | extend Providers = replace_regex(Provider, @"[-]", "")
+    | where LastSeenNum <= 5
+    | summarize
+        Domains = make_set(Domain, 1),
+        Providers = make_set(Providers, 1),
+        Type = make_set(ProxyType),
+        ISP = make_set(ISP, 1)
+        by ASN, CountryCode;
+let lookback = 30d;
+let inc = materialize (
+    SecurityIncident
+    | where Title contains "compromise"
+    //| where IncidentNumber == "" // insert incident number
+    | mv-expand AlertIds
+    | extend id = tostring(AlertIds)
+    | distinct id, Title
+    );
+let alert =
+    SecurityAlert
+    | where SystemAlertId in((inc
+        | project id))
+    | extend Entities = parse_json(Entities)
+    | mv-expand Entities
+    | extend prince = tostring(Entities.AadUserId)
+    | where isnotempty(prince)
+    | top 1 by TimeGenerated
+    | project prince;
+let EntityAlert =
+    SecurityAlert
+    | where SystemAlertId in~((inc
+        | project id))
+    | where TimeGenerated > ago(lookback)
+    | extend Ents = parse_json(Entities)
+    | mv-apply E = Ents on (where E.Type == "ip"
+        | project AlertIP = tostring(E.Address))
+    | mv-apply E = Ents on (where E.Type == "account"
+        | project AlertUserUPN = tostring(E.UserPrincipalName));
+let identity = materialize (
+    IdentityInfo
+    | where TimeGenerated >= ago(14d)
+    | where AccountObjectId in~(alert)
+    | summarize arg_max(TimeGenerated, AccountUPN, JobTitle, Department, Country, AssignedRoles) by AccountObjectId
+    | project
+        UPN = tolower(AccountUPN),
+        JobTitle,
+        Department,
+        Country,
+        Privs = tostring(AssignedRoles)
+    );
+let leak =
+    SecurityAlert
+    | where TimeGenerated >= ago(48h)
+    | where AlertName has "Leaked"
+    | extend Entities = parse_json(Entities)
+    | mv-expand Entities
+    | extend user = tostring(Entities.UserPrincipalName)
+    | where isnotempty(user)
+    | distinct user;
+let isp = materialize (
+    IdentityLogonEvents
+    | where TimeGenerated >= ago(lookback)
+    | summarize arg_max(TimeGenerated, ISP) by IPAddress
+    | project ISPaddress = IPAddress, ISP
+    );
+let unionlog = materialize (
+    union
+        (SigninLogs
+        | where TimeGenerated >= ago(lookback)
+        | where UserPrincipalName in(identity)
+        | extend
+            Table = "SigninLogs",
+            DeviceDetail = todynamic(DeviceDetail),
+            AuthDetails = todynamic(AuthenticationDetails)),
+        (AADNonInteractiveUserSignInLogs
+        | where TimeGenerated >= ago(lookback)
+        | where UserPrincipalName in(identity)
+        | extend
+            Table = "AADNonInteractiveUserSignInLogs",
+            DeviceDetail = todynamic(DeviceDetail),
+            AuthDetails = todynamic(AuthenticationDetails))
+    | extend Method = strcat(tostring(AuthDetails[0].authenticationMethod), ", ", tostring(AuthDetails[0].authenticationStepResultDetail))
+    | extend Device = strcat(tostring(DeviceDetail.operatingSystem), "  ", tostring(DeviceDetail.displayName))
+    | extend DeviceRelationship = strcat("Compliant: ", tostring(DeviceDetail.isCompliant), " Managed: ", tostring(DeviceDetail.isManaged))
+    | extend isleaked = UserPrincipalName in(leak)
+    | distinct
+        Table,
+        TimeGenerated,
+        UserPrincipalName,
+        IPAddress,
+        UserAgent,
+        AutonomousSystemNumber,
+        Location,
+        AppDisplayName,
+        ResourceDisplayName,
+        ResultType,
+        ResultDescription,
+        ResultSignature,
+        Device,
+        DeviceRelationship,
+        Method,
+        isleaked
+    | lookup kind = leftouter isp on $left.IPAddress == $right.ISPaddress
+    | lookup kind = leftouter identity on $left.UserPrincipalName == $right.UPN
+    | lookup kind = leftouter (
+        _GetWatchlist('Alpha2')
+        | project Land = tostring(['Land']), Alpha2 = tostring(['Alpha2'])
+        )
+        on $left.Country == $right.Land
+    );
+let ASNcount =
+    unionlog
+    | where ResultType has_any("0", "50140")
+    | summarize ASNseen = count() by AutonomousSystemNumber;
+let alertRow =
+    EntityAlert
+    | join hint.strategy = broadcast kind = inner (unionlog)
+        on
+        $left.AlertUserUPN == $right.UserPrincipalName,
+        $left.AlertIP == $right.IPAddress
+    | top 1 by TimeGenerated
+    | lookup kind = leftouter ASNcount on AutonomousSystemNumber
+    | project
+        AlertUPN = UserPrincipalName,
+        Department,
+        JobTitle,
+        AlertAlpha2 = Alpha2,
+        AppDisplayName,
+        AlertIP = IPAddress,
+        AlertASN = AutonomousSystemNumber,
+        ASNseen = coalesce(ASNseen, 0),
+        ISP,
+        AlertLocation = Location,
+        AlertUA = UserAgent,
+        Device,
+        DeviceRelationship,
+        Method,
+        ResultSignature,
+        Description,
+        Privs,
+        isleaked;
+let historyStats =
+    unionlog
+    | summarize
+        TotalSignins = dcount(TimeGenerated),
+        DistinctIPs = dcount(IPAddress),
+        DistinctASNs = dcount(AutonomousSystemNumber),
+        DistinctCountries = dcount(Alpha2),
+        DistinctLocations = dcount(Location),
+        DistinctApps = dcount(ResourceDisplayName),
+        DistinctUAs = dcount(UserAgent),
+        Successes = dcountif(TimeGenerated, ResultType in("0", "50140")),
+        Failures = dcountif(TimeGenerated, ResultType !in("0", "50140")),
+        BruteforceAttempts = dcountif(TimeGenerated, ResultType in("50126", "50053", "50055", "50056", "50074", "50079", "50173")),
+        MfaInterrupts = dcountif(TimeGenerated, ResultType == "50140"),
+        BlockedByCA = dcountif(TimeGenerated, ResultType in("53003", "530032"))
+        by UserPrincipalName
+    | join kind = inner (
+        unionlog
+        | summarize n = dcount(TimeGenerated) by UserPrincipalName, ResultType, ResultDescription
+        | summarize arg_max(n, ResultType, ResultDescription) by UserPrincipalName
+        | project-rename
+            TopResultCodeCount = n,
+            TopResultCode = ResultType,
+            TopResultReason = ResultDescription
+        )
+        on UserPrincipalName
+    | project-away UserPrincipalName1;
+let geoMismatch =
+    unionlog
+    | extend IsMismatch = isnotempty(Alpha2) and isnotempty(Country) and Alpha2 != Country
+    | summarize
+        GeoMismatches = dcountif(TimeGenerated, IsMismatch),
+        MismatchCountries = make_set_if(Alpha2, IsMismatch, 25)
+        by UserPrincipalName;
+alertRow
+| join kind = leftouter historyStats on $left.AlertUPN == $right.UserPrincipalName
+| join kind = leftouter geoMismatch on $left.AlertUPN == $right.UserPrincipalName
+| join kind = leftouter IP2ProxyLite on $left.AlertASN == $right.ASN, $left.AlertLocation == $right.CountryCode
+| extend bruteforceRatio = todouble(BruteforceAttempts) / TotalSignins
+| extend
+    bruteforceNote = case(
+                         BruteforceAttempts == 0,
+                         "No bruteforce related failures observed",
+                         bruteforceRatio >= 0.5,
+                         strcat(tostring(BruteforceAttempts), " x failures (", tostring(round(bruteforceRatio * 100, 1)), "% of sign-ins) showing strong bruteforce indicator"),
+                         bruteforceRatio >= 0.2,
+                         strcat(tostring(BruteforceAttempts), " x failures (", tostring(round(bruteforceRatio * 100, 1)), "% of sign-ins) potentially suggesting bruteforce activity"),
+                         strcat(tostring(BruteforceAttempts), " x failures (", tostring(round(bruteforceRatio * 100, 1)), "% of sign-ins) observed")
+                     ),
+    geoNote = case(
+                  GeoMismatches > 0,
+                  strcat(tostring(GeoMismatches), " sign-in(s) from outside home country (", strcat_array(MismatchCountries, ", "), ")"),
+                  "No geographic mismatches against home country"
+              ),
+    leakNote = iff(isleaked, "The user's credentials have been observed in a known leak", "No credential leak observed for this user"),
+    privNote = iff(isnotempty(Privs) and Privs != "[]", strcat("Privileged group membership: ", Privs), "No privileged group membership assigned")
+| extend RawStats = strcat(
+                        "User             : ",
+                        AlertUPN,
+                        "\n",
+                        "Department       : ",
+                        Department,
+                        "\n",
+                        "Role             : ",
+                        JobTitle,
+                        "\n",
+                        "Home Country     : ",
+                        AlertAlpha2,
+                        "\n",
+                        "Sign-in Location : ",
+                        AlertLocation,
+                        "\n",
+                        "Application      : ",
+                        AppDisplayName,
+                        "\n",
+                        "Source IP        : ",
+                        AlertIP,
+                        "\n",
+                        "ASN              : ",
+                        tostring(AlertASN),
+                        "  (seen ",
+                        tostring(ASNseen),
+                        "x in 30d)\n",
+                        "Provider         : ",
+                        coalesce(ISP1, ISP, Domains),
+                        "",
+                        Providers,
+                        "\n",
+                        "Result           : ",
+                        ResultSignature,
+                        "\n",
+                        "Auth Method           : ",
+                        Method,
+                        "\n",
+                        "Device Detail    : ",
+                        coalesce(Device, "Unknown"),
+                        "\n",
+                        "Device Relationship: ",
+                        DeviceRelationship,
+                        "\n"
+                    )
+| extend NarrativeAlert = strcat(
+                              "An alert triggered when ",
+                              AlertUPN,
+                              coalesce(
+                                  strcat(
+                                      " ",
+                                      JobTitle,
+                                      " ",
+                                      Department
+                                  ),
+                                  ""
+                              ),
+                              " based in ",
+                              coalesce(AlertAlpha2, "[unlisted country] "),
+                              " attempted to sign into ",
+                              coalesce(AppDisplayName, "unknown app"),
+                              " via ",
+                              AlertIP,
+                              " on ASN ",
+                              tostring(AlertASN),
+                              " ",
+                              coalesce(ISP1, ISP, Domains),
+                              "",
+                              Providers,
+                              " ",
+                              " located in the ",
+                              coalesce(AlertLocation, "unknown location"),
+                              "."
+    " This ASN has been seen ",
+                              tostring(ASNseen),
+                              " time(s) successfully signing in the last 30 days."
+    ,
+                              " Device is listed as ",
+                              coalesce(Device, " unknown "),
+                              " with the user-agent '",
+                              AlertUA,
+                              ". Authentication method reveals: ",
+                              Method,
+                              " (",
+                              Description,
+                              ")"
+                          )
+| extend NarrativeHistory = strcat(
+                                " Over the last 30 days the user has ",
+                                tostring(TotalSignins),
+                                " total sign-in events (",
+                                tostring(Successes),
+                                " successful, ",
+                                tostring(Failures),
+                                " failed)",
+                                " across ",
+                                tostring(DistinctIPs),
+                                " distinct IPs, ",
+                                tostring(DistinctASNs),
+                                " ASNs, ",
+                                tostring(DistinctLocations),
+                                " countries and ",
+                                tostring(DistinctApps),
+                                " applications.",
+                                " Most frequent result code is ",
+                                TopResultCode,
+                                " ",
+                                TopResultReason,
+                                " (",
+                                tostring(TopResultCodeCount),
+                                " occurrences).",
+                                " ",
+                                bruteforceNote,
+                                ".",
+                                " ",
+                                geoNote,
+                                "."
+                            )
+| extend NarrativeIdentity = strcat("", leakNote, ". ", privNote, ".")
+| extend NarrativeSummary = strcat(NarrativeAlert, "\n\n", NarrativeHistory, "\n\n", NarrativeIdentity)
+| project RawStats, NarrativeSummary
