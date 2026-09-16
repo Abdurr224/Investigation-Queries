@@ -1,5 +1,5 @@
-Potential user account compromise
-Sign In Decomposition now in the query packs as a click to run.
+Potential user account compromise:
+Sign In Decomposition now in sentinel query packs as a click to run.
 Currently set to look for "Potential Compromise" alerts from latest
 
 - Narrative based Summary
