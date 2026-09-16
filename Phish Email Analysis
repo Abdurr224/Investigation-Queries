@@ -1,0 +1,76 @@
+let incidentNumber = dynamic([""]);   //INSERT INCIDENT NUMBER
+let lookback       = 30d;
+let TweetFeedDomains =
+externaldata(EventDate: string, User: string, Type: string, Indicator: string, Tags: string, TweetUrl: string)
+[h'https://raw.githubusercontent.com/0xDanielLopez/TweetFeed/master/month.csv']
+with (format='csv', ignoreFirstRecord=false)
+| where Type == "domain"
+| extend RootDomain = Indicator
+| where isnotempty(RootDomain)
+| distinct RootDomain, Tags, TweetUrl;
+let alertIds = toscalar(
+SecurityIncident
+| where IncidentNumber in (incidentNumber)
+| mv-expand AlertIds
+| summarize make_set(tostring(AlertIds))
+);
+let MailEntities = materialize(
+SecurityAlert
+| where SystemAlertId in (alertIds)
+| mv-expand Entities = parse_json(Entities)
+| extend Sender = tolower(tostring(coalesce(Entities.Sender, Entities.P1Sender, Entities.P2Sender)))
+| where isnotempty(Sender)
+| extend
+Recipient        = tostring(Entities.Recipient),
+Subject          = tostring(Entities.Subject),
+NetworkMessageId = tostring(Entities.NetworkMessageId),
+UrlsArray        = Entities.Urls
+| project NetworkMessageId, Sender, Recipient, Subject, AlertName, UrlsArray
+);
+let nmids = toscalar(MailEntities
+| summarize make_set(NetworkMessageId));
+let Meta =
+MailEntities
+| summarize
+Recipients = make_set(Recipient),
+Subjects   = make_set(Subject),
+Alerts     = make_set(AlertName)
+by NetworkMessageId, Sender;
+let AllUrls =
+union
+(
+MailEntities
+| mv-expand UrlEntity = UrlsArray
+| project NetworkMessageId, Url = tostring(UrlEntity)
+),
+(
+EmailUrlInfo
+| where TimeGenerated >= ago(lookback)
+| where NetworkMessageId in (nmids)
+| project NetworkMessageId, Url
+)
+| where isnotempty(Url)
+| extend Host = tolower(extract(@"(?:https?:\/\/)?(?:[^\/\s@]+@)?(?:www\.)?([^\/:\?\#\s]+)", 1, tolower(Url)))
+| join kind=leftouter TweetFeedDomains on $left.Host == $right.RootDomain
+| summarize
+URLs      = make_set(Url),
+Domains   = make_set(Host),
+FeedIOC   = make_set_if(RootDomain, isnotempty(RootDomain)),
+FeedTags  = make_set_if(Tags, isnotempty(Tags)),
+FeedMatch = dcountif(RootDomain, isnotempty(RootDomain)),
+Source    = make_set(TweetUrl)
+by NetworkMessageId;
+Meta
+| join kind=leftouter AllUrls on NetworkMessageId
+| project
+NetworkMessageId,
+Sender,
+Recipients,
+Subjects,
+URLs,
+Domains,
+FeedIOC,
+FeedTags,
+FeedMatch,
+Source,
+Alerts
