@@ -1,0 +1,115 @@
+//0.97
+let inc = SecurityIncident
+    | where IncidentNumber == "" //insert incident number
+    | mv-expand AlertIds
+    | extend id = tostring(AlertIds)
+    | distinct id;
+let alert = SecurityAlert
+    | where SystemAlertId in (inc)
+    | extend Entities = parse_json(Entities)
+    | mv-expand Entities
+    | project prince = tostring(Entities.AadUserId)    
+    | where isnotempty(prince);
+//use below to search specific people
+//
+let lookback = 2d;
+let identity = materialize (IdentityInfo
+    //| where AccountUPN contains ""    
+    | where AccountObjectId in~ (alert) // Comment out 
+    | where TimeGenerated >= ago(14d)
+    | distinct
+        UPN = tolower(AccountUPN),
+        JobTitle,
+        Department,
+        Country,
+        Privs = tostring(AssignedRoles));
+let x = AuditLogs
+| where TargetResources[0].id in (alert) //Comment out
+| where OperationName contains "Reset User Password"
+| where Identity contains "JUMPSEC-StudentAccountCompromise-P1"
+| extend user =  tostring(TargetResources[0].userPrincipalName)
+| summarize arg_max(TimeGenerated,*);
+let leak = SecurityAlert
+    | where TimeGenerated >= ago(30d)
+    | where AlertName contains "Leaked"
+    | extend parse_json(tostring(Entities))
+    | extend leaked = iff(Status != "Resolved", "True", "")
+    | where isnotempty(leaked)
+    | project user = Entities[0].UserPrincipalName, TimeGenerated, leaked
+    | distinct leaked_user = tostring(user);
+let ASNcount = SigninLogs
+    | where UserPrincipalName in (identity)
+    | where TimeGenerated >= ago(30d)
+    | where ResultType in ("0","50140")
+    | summarize num = count() by (AutonomousSystemNumber);
+//
+union SigninLogs, AADNonInteractiveUserSignInLogs
+| where TimeGenerated >= ago(lookback)
+| where UserPrincipalName in (identity)
+| extend leaked = UserPrincipalName in (leak)
+| extend size = substring(UserAgent, 0, 11)
+| extend AuthenticationDetails = parse_json(AuthenticationDetails)
+| mv-expand AuthenticationDetails
+| extend DeviceDetail = iff(isempty(DeviceDetail_dynamic) == true, parse_json(DeviceDetail_string), DeviceDetail_dynamic)
+| extend Location = iff(isempty(LocationDetails_dynamic) == true, parse_json(LocationDetails_string), LocationDetails_dynamic)
+| extend AuthMethod = strcat(AuthenticationDetails.authenticationMethod," - ",AuthenticationDetails.authenticationStepResultDetail)
+| extend TrustDev = iff(tostring(DeviceDetail.trustType) != "", "Managed", "Unmanaged")
+| extend TrustNet =iff(NetworkLocationDetails != "[]", "trusted", "")
+| extend AuthReq = iif(
+                       AuthenticationRequirement contains "singleFactorAuthentication", 
+                       AuthenticationRequirement = "SFA",
+                       "MFA"
+                   )
+| extend ResultSignature = iff(ResultType contains "50140", "SUCCESS*", ResultSignature)
+| extend Description = iif(ResultSignature == "FAILURE", ResultDescription, "")
+| extend Result = iif(ResultSignature == "FAILURE", strcat("Failure , ", tostring(ResultType), " , ", tostring(Description)), "Success") 
+| extend ASN_IP = strcat("AS", tostring(AutonomousSystemNumber), " | ", IPAddress)
+| extend Device = strcat(tostring(DeviceDetail.browser), " - ", tostring(DeviceDetail.operatingSystem), " - ", size, " - ", tostring(DeviceDetail.displayName))
+|join kind=leftouter ( x
+| project ChangeTime = TimeGenerated, user, OperationName)
+ on $left.UserPrincipalName==$right.user
+| join kind=inner (
+    identity
+    )
+    on $left.UserPrincipalName == $right.UPN
+| join kind=leftouter (
+    _GetWatchlist('Alpha2')
+    | project Land = ["Land"], Alpha2 = ["Alpha2"]
+    )
+    on $left.Country == $right.Land
+| extend loc = iff(Country == Land, Alpha2, "")
+| extend RemStatus = case(
+    ChangeTime > TimeGenerated, "Already Remediated",
+    ChangeTime < TimeGenerated and ChangeTime >= TimeGenerated - 24h, "Recently Remediated",
+    ""
+)
+| join kind=leftouter ASNcount on AutonomousSystemNumber
+| project
+    TimeGenerated,
+    UserPrincipalName,
+    AppDisplayName,
+    UserLoc_IPLoc = strcat(iff(isempty(loc), "N/A", loc), " to ", Location.countryOrRegion),
+    ASN_IP,
+    ASNFreq = iff(isempty(num), 0, num),//successful sign ins from ASN
+    Result,
+    Device,
+    TrustDev,
+    AuthMethod,
+    Auth_CAP = strcat(tostring(AuthReq), " - ", tostring(ConditionalAccessStatus)),
+    Department_Role = strcat(tostring(JobTitle), " - ", tostring(Department)),
+    CredsLeaked = leaked,
+    RemStatus = pack("[S]", RemStatus, "[T]", tostring(ChangeTime)),
+    Privs
+| extend Summary = strcat(
+    UserPrincipalName,
+    " who is a ", Department_Role,
+    " attempted to sign in to ", AppDisplayName,
+    " from ",UserLoc_IPLoc,
+    " using ", ASN_IP," on ", Device,
+    " where this ASNs success in the last 30d is ",ASNFreq,
+    ". The sign-in resulted in ", Result,
+    " The authentication detail showed " , AuthMethod,
+    " .The device trust level was ", TrustDev,
+    ". The user's credentials leaked status is ", CredsLeaked,
+    " .The latest remediation status and time for this user: ", RemStatus,"."
+)
